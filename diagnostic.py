@@ -78,7 +78,9 @@ def test_no_double_exit():
     capital_after = system.risk_manager.current_capital
 
     assert capital_before != capital_after, "Exit did not change capital"
-    assert capital_after == capital_before - 75, "Capital changed more than once!"
+    delta = capital_after - capital_before
+    expected = system.last_closed_trade["net_pnl"]
+    assert abs(delta - expected) < 1e-6, "Capital changed more than once!"
 
     print("PASS: exit executed exactly once")
 

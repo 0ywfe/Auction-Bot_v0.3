@@ -1,0 +1,25 @@
+# Ignore all data files
+/Data/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+env/
+*.egg-info/
+
+# macOS system files
+.DS_Store
+
+# Logs
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Optional: ignore compiled files
+*.so
+*.dll
+*.exe
