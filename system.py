@@ -1,0 +1,369 @@
+# system.py — Auction Failure Trading System (HARDENED)
+
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+from enum import Enum, auto
+from dataclasses import dataclass
+import logging
+import json
+import numpy as np
+
+from config import Config
+from market import MarketState, BarVolumeProfile
+from risk import RiskManager
+
+
+# =========================
+# ENUMS
+# =========================
+
+class TradingState(Enum):
+    INITIALIZING = auto()
+    NO_TRADE = auto()
+    MONITORING = auto()
+    IN_TRADE = auto()
+    COOLDOWN = auto()
+    STOPPED = auto()
+
+class PositionDirection(Enum):
+    LONG = auto()
+    SHORT = auto()
+    FLAT = auto()
+
+
+# =========================
+# DATA STRUCTURES
+# =========================
+
+@dataclass
+class Position:
+    direction: PositionDirection
+    entry_price: float
+    entry_time: datetime
+    size: int
+    stop_loss: float
+    profit_targets: List[float]
+    time_stop: datetime
+
+    @property
+    def is_active(self) -> bool:
+        return self.direction != PositionDirection.FLAT
+
+
+# =========================
+# ADAPTIVE PARAMETERS
+# =========================
+
+class AdaptiveParameters:
+    def __init__(self, config: Config):
+        self.config = config
+        self.avg_volume = 0.0
+        self.recent_volatility = config.VOLATILITY_BASELINE
+        self.recent_range = 0.0
+
+    def update(self, market_data: List[MarketState]):
+        """
+        Update adaptive statistics.
+        Safe against insufficient data.
+        """
+        n = len(market_data)
+        if n < 5:
+            return  # absolutely nothing to do yet
+
+        # --- Average volume
+        vols = [m.volume for m in market_data[-min(30, n):]]
+        self.avg_volume = float(np.mean(vols)) if vols else 0.0
+
+        # --- Recent range
+        prices = [m.close for m in market_data[-min(30, n):]]
+        self.recent_range = max(prices) - min(prices)
+
+        # --- Realized volatility (log returns)
+        if n < 21:
+            return  # not enough bars for volatility
+
+        returns = []
+        for i in range(n - 20, n):
+            prev = market_data[i - 1].close
+            curr = market_data[i].close
+            if prev > 0:
+                returns.append(curr / prev - 1)
+
+        if returns:
+            self.recent_volatility = np.std(returns) * np.sqrt(252)
+
+
+    def acceptance_window_minutes(self) -> int:
+        vol_ratio = max(0.5, min(2.0, self.recent_volatility / self.config.VOLATILITY_BASELINE))
+        return int(10 / vol_ratio)
+
+
+# =========================
+# MAIN SYSTEM
+# =========================
+
+class AuctionFailureSystem:
+
+        
+    def _enforce_risk_kill(self, timestamp: datetime):
+        if self.risk_manager.is_hard_stopped():
+            if self.state != TradingState.STOPPED:
+                self._transition(
+                    TradingState.STOPPED,
+                    "Risk limit breached",
+                    timestamp
+                )
+
+    
+    def __init__(self, instrument: str = "MES", initial_capital: float = 10000.0):
+        self.config = Config()
+        self.instrument = instrument
+
+        self.state = TradingState.INITIALIZING
+        self.position = Position(PositionDirection.FLAT, 0.0, datetime.utcnow(), 0, 0.0, [], datetime.utcnow())
+        self.cooldown_until: Optional[datetime] = None
+
+        self.market_data: List[MarketState] = []
+        self.volume_profile = BarVolumeProfile(self.config.VOLUME_PROFILE_WINDOW_MINUTES)
+        self.adaptive = AdaptiveParameters(self.config)
+
+        self.risk_manager = RiskManager(self.config, initial_capital)
+
+        self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.last_closed_trade: Optional[Dict] = None
+
+        self.last_reset_date = None
+
+        self._setup_logging()
+
+
+
+    # =========================
+    # LOGGING
+    # =========================
+
+    def _setup_logging(self):
+        self.logger = logging.getLogger("auction_bot")
+        self.logger.setLevel(logging.INFO)
+
+        if not self.logger.handlers:
+            fh = logging.FileHandler(f"trading_{datetime.utcnow().strftime('%Y%m%d')}.log")
+            fh.setFormatter(logging.Formatter("%(message)s"))
+            self.logger.addHandler(fh)
+
+    def log(self, event: str, market_time: Optional[datetime], data: Dict = None, level="INFO"):
+        payload = {
+            "event": event,
+            "state": self.state.name,
+            "wall_time": datetime.utcnow().isoformat(),
+            "market_time": market_time.isoformat() if market_time else None,
+            "position": {
+                "direction": self.position.direction.name,
+                "size": self.position.size,
+                "entry_price": self.position.entry_price,
+            },
+            "risk": {
+                "capital": self.risk_manager.current_capital,
+                "daily_pnl": self.risk_manager.daily_pnl,
+                "drawdown": self.risk_manager.current_drawdown,
+            },
+            "data": data or {},
+        }
+        msg = json.dumps(payload, default=str)
+        getattr(self.logger, level.lower())(msg)
+
+    # =========================
+    # FSM HELPERS
+    # =========================
+
+    def _transition(self, new_state: TradingState, reason: str, market_time: datetime):
+        old = self.state
+        self.state = new_state
+        self.log("STATE_CHANGE", market_time, {
+            "from": old.name,
+            "to": new_state.name,
+            "reason": reason,
+        })
+
+    def _enforce_invariants(self, market_time: datetime):
+        if self.state == TradingState.IN_TRADE and not self.position.is_active:
+            self.log("INVARIANT_VIOLATION", market_time, {"issue": "IN_TRADE but flat"}, level="ERROR")
+            self._transition(TradingState.MONITORING, "Invariant correction", market_time)
+
+    # =========================
+    # CORE LOOP
+    # =========================
+
+    def process_market_update(self, ms: MarketState):
+
+        self._enforce_risk_kill(ms.timestamp)
+        if self.state == TradingState.STOPPED:
+            return
+        
+        self._enforce_invariants(ms.timestamp)
+
+        self.market_data.append(ms)
+        self.market_data = self.market_data[-self.config.MAX_BARS_STORED:]
+
+        self.volume_profile.update(ms.timestamp, ms.typical_price, ms.volume)
+        self.adaptive.update(self.market_data)
+
+        # --- DAILY RESET
+        if self.last_reset_date != ms.timestamp.date() and ms.timestamp.time() >= self.config.SESSION_START:
+            self.risk_manager.reset_daily()
+            self.trades_today = self.wins_today = self.losses_today = 0
+            self.last_reset_date = ms.timestamp.date()
+            self.log("DAILY_RESET", ms.timestamp)
+
+        # --- FSM
+        if self.state == TradingState.INITIALIZING:
+            if len(self.market_data) >= self.config.MIN_BARS_FOR_ANALYSIS:
+                self._transition(
+                    TradingState.MONITORING if self._in_hours(ms.timestamp) else TradingState.NO_TRADE,
+                    "Warmup complete",
+                    ms.timestamp
+                )
+
+        elif self.state == TradingState.MONITORING:
+            if not self._in_hours(ms.timestamp):
+                self._transition(TradingState.NO_TRADE, "Market closed", ms.timestamp)
+                return
+
+            can_trade, reason = self.risk_manager.can_trade()
+            if not can_trade:
+                self._transition(TradingState.STOPPED, reason, ms.timestamp)
+                return
+
+            setup = self._detect_setup(ms)
+            if setup and self._confirm_setup(setup, ms):
+                self._enter_trade(setup, ms)
+
+        elif self.state == TradingState.IN_TRADE:
+            reason = self._check_exit(ms)
+            if reason:
+                self._exit_trade(ms, reason)
+                return  # EXIT ONCE PER BAR
+
+        elif self.state == TradingState.COOLDOWN:
+            if self.cooldown_until and ms.timestamp >= self.cooldown_until:
+                self._transition(
+                    TradingState.MONITORING if self._in_hours(ms.timestamp) else TradingState.NO_TRADE,
+                    "Cooldown ended",
+                    ms.timestamp
+                )
+                self.cooldown_until = None
+
+    # =========================
+    # STRATEGY LOGIC
+    # =========================
+
+    def _in_hours(self, t: datetime) -> bool:
+        return self.config.NO_TRADE_START <= t.time() <= self.config.NO_TRADE_END
+
+    def _detect_setup(self, ms: MarketState) -> Optional[Dict]:
+        if len(self.market_data) < self.config.MIN_BARS_FOR_ANALYSIS:
+            return None
+
+        vlow, vhigh = self.volume_profile.get_value_area()
+        if vlow == vhigh:
+            return None
+
+        if ms.close > vhigh and ms.volume < self.adaptive.avg_volume * self.config.LOW_VOLUME_THRESHOLD:
+            return {"type": "UPSIDE_ATTEMPT", "value_high": vhigh, "setup_time": ms.timestamp}
+
+        if ms.close < vlow and ms.volume < self.adaptive.avg_volume * self.config.LOW_VOLUME_THRESHOLD:
+            return {"type": "DOWNSIDE_ATTEMPT", "value_low": vlow, "setup_time": ms.timestamp}
+
+        return None
+
+    def _confirm_setup(self, setup: Dict, ms: MarketState) -> bool:
+        if (ms.timestamp - setup["setup_time"]).total_seconds() / 60 > self.adaptive.acceptance_window_minutes():
+            return False
+
+        if ms.volume <= self.adaptive.avg_volume * self.config.HIGH_VOLUME_THRESHOLD:
+            return False
+
+        return True
+
+    # =========================
+    # TRADE EXECUTION
+    # =========================
+
+    def _enter_trade(self, setup: Dict, ms: MarketState):
+        if self.position.is_active:
+            self.log("ENTRY_BLOCKED_ALREADY_IN_TRADE", ms.timestamp)
+            return
+
+        direction = PositionDirection.SHORT if setup["type"] == "UPSIDE_ATTEMPT" else PositionDirection.LONG
+        stop = ms.close + 10 if direction == PositionDirection.SHORT else ms.close - 10
+        size = self.risk_manager.get_position_size(abs(ms.close - stop), self.instrument)
+
+        self.position = Position(
+            direction, ms.close, ms.timestamp, size, stop,
+            self.volume_profile.get_value_area(), ms.timestamp + timedelta(minutes=self.config.TIME_STOP_MINUTES)
+        )
+
+        self._transition(TradingState.IN_TRADE, "Position entered", ms.timestamp)
+        self.log("POSITION_ENTERED", ms.timestamp, {"direction": direction.name, "size": size})
+
+    def _exit_trade(self, ms: MarketState, reason: str):
+        if not self.position.is_active:
+            self.log("EXIT_IGNORED_ALREADY_FLAT", ms.timestamp)
+            return
+
+        pnl = (
+            (ms.close - self.position.entry_price)
+            if self.position.direction == PositionDirection.LONG
+            else (self.position.entry_price - ms.close)
+        ) * self.position.size * 5
+
+        # Update risk first
+        self.risk_manager.update_pnl(pnl)
+
+        # Update stats + log the trade closure no matter what
+        self.trades_today += 1
+        self.wins_today += int(pnl > 0)
+        self.losses_today += int(pnl <= 0)
+
+        self.last_closed_trade = {
+            "entry_time": self.position.entry_time,
+            "exit_time": ms.timestamp,
+            "pnl": pnl,
+            "reason": reason,
+        }
+
+        self.log("POSITION_EXITED", ms.timestamp, self.last_closed_trade)
+
+        # Flatten position
+        self.position = Position(PositionDirection.FLAT, 0, datetime.utcnow(), 0, 0, [], datetime.utcnow())
+
+        # Enforce kill switch AFTER clean closure
+        self._enforce_risk_kill(ms.timestamp)
+        if self.state == TradingState.STOPPED:
+            return
+
+        # Normal post-exit state transition
+        if pnl < 0:
+            self.cooldown_until = ms.timestamp + timedelta(minutes=self.config.COOLDOWN_MINUTES_AFTER_LOSS)
+            self._transition(TradingState.COOLDOWN, "Loss", ms.timestamp)
+        else:
+            self._transition(TradingState.MONITORING, "Profit", ms.timestamp)
+
+
+    def _check_exit(self, ms: MarketState) -> Optional[str]:
+        if not self.position.is_active:
+            return None
+
+        if self.position.direction == PositionDirection.LONG and ms.close <= self.position.stop_loss:
+            return "STOP_LOSS"
+        if self.position.direction == PositionDirection.SHORT and ms.close >= self.position.stop_loss:
+            return "STOP_LOSS"
+
+        if ms.timestamp >= self.position.time_stop:
+            return "TIME_STOP"
+
+        return None
+    
+
