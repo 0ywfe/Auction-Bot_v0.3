@@ -1,1 +1,2 @@
-
+setup_time,setup_type,entry_time,exit_time,direction,size,gross_pnl,net_pnl,commission,slippage,mae,mfe,time_in_trade_min,exit_reason
+2024-09-17 10:05:00+00:00,UPSIDE_ATTEMPT,2024-09-17 10:05:00+00:00,2024-09-17 10:06:00+00:00,SHORT,1,-303.75,-307.4,2.4,1.25,306.25,3.75,1.0,STOP_LOSS

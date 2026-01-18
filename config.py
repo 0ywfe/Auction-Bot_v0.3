@@ -89,3 +89,5 @@ class Config:
     # Range-proxy slippage (if enabled)
     RANGE_SLIPPAGE_MIN_TICKS: float = 0.5
     RANGE_SLIPPAGE_MAX_TICKS: float = 2.0
+    BASE_ACCEPTANCE_WINDOW_MINUTES: int = 10  # used by AdaptiveParameters
+    # =====================================================

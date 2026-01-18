@@ -1,5 +1,5 @@
 # system.py — Auction Failure Trading System
-# V0.2: Edge Validation (paper execution + accounting only)
+# V0.2: Trade-Density Calibration (instrumentation + pending setup tracking)
 
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
@@ -14,10 +14,6 @@ from market import MarketState, BarVolumeProfile
 from risk import RiskManager
 
 
-# =========================
-# ENUMS
-# =========================
-
 class TradingState(Enum):
     INITIALIZING = auto()
     NO_TRADE = auto()
@@ -26,15 +22,12 @@ class TradingState(Enum):
     COOLDOWN = auto()
     STOPPED = auto()
 
+
 class PositionDirection(Enum):
     LONG = auto()
     SHORT = auto()
     FLAT = auto()
 
-
-# =========================
-# DATA STRUCTURES
-# =========================
 
 @dataclass
 class Position:
@@ -50,10 +43,6 @@ class Position:
     def is_active(self) -> bool:
         return self.direction != PositionDirection.FLAT
 
-
-# =========================
-# ADAPTIVE PARAMETERS
-# =========================
 
 class AdaptiveParameters:
     def __init__(self, config: Config):
@@ -87,16 +76,13 @@ class AdaptiveParameters:
             self.recent_volatility = np.std(returns) * np.sqrt(252)
 
     def acceptance_window_minutes(self) -> int:
+        # Same logic as before, but base minutes is configurable for calibration
+        base = getattr(self.config, "BASE_ACCEPTANCE_WINDOW_MINUTES", 10)
         vol_ratio = max(0.5, min(2.0, self.recent_volatility / self.config.VOLATILITY_BASELINE))
-        return int(10 / vol_ratio)
+        return int(base / vol_ratio)
 
-
-# =========================
-# MAIN SYSTEM
-# =========================
 
 class AuctionFailureSystem:
-
     def __init__(self, instrument: str = "MES", initial_capital: float = 10000.0):
         self.config = Config()
         self.instrument = instrument
@@ -111,23 +97,39 @@ class AuctionFailureSystem:
 
         self.risk_manager = RiskManager(self.config, initial_capital)
 
-        self.trades_today = 0
-        self.wins_today = 0
-        self.losses_today = 0
-
         # V0.2 trade record
         self.last_closed_trade: Optional[Dict] = None
 
-        # V0.2 MAE / MFE tracking
+        # Pending setup tracking (auction failure concept unchanged)
+        self.pending_setup: Optional[Dict] = None
+
+        # Track setup time for dataset
+        self._current_setup_time: Optional[datetime] = None
+        self._current_setup_type: Optional[str] = None
+
+        # MAE/MFE tracking (points)
         self._mae = 0.0
         self._mfe = 0.0
+
+        # Trade-density instrumentation (requested)
+        self.density = {
+            "setups_detected": 0,
+            "setups_failed_volume_confirm": 0,   # setups that expire without ever meeting volume confirm
+            "setups_expired_time_window": 0,     # setups whose window expired before entry
+            "entries_blocked_by_session": 0,     # pending setup dropped because session ended
+            "entries_blocked_by_risk": 0,        # risk prevented entry
+            # extra helpful counters (not strategy)
+            "bars_total": 0,
+            "bars_in_session": 0,
+            "bars_outside_session": 0,
+        }
 
         self.last_reset_date = None
         self._setup_logging()
 
-    # =========================
+    # -------------------------
     # LOGGING
-    # =========================
+    # -------------------------
 
     def _setup_logging(self):
         self.logger = logging.getLogger("auction_bot")
@@ -158,18 +160,14 @@ class AuctionFailureSystem:
         }
         getattr(self.logger, level.lower())(json.dumps(payload, default=str))
 
-    # =========================
+    # -------------------------
     # FSM HELPERS
-    # =========================
+    # -------------------------
 
     def _transition(self, new_state: TradingState, reason: str, market_time: datetime):
         old = self.state
         self.state = new_state
-        self.log("STATE_CHANGE", market_time, {
-            "from": old.name,
-            "to": new_state.name,
-            "reason": reason,
-        })
+        self.log("STATE_CHANGE", market_time, {"from": old.name, "to": new_state.name, "reason": reason})
 
     def _enforce_invariants(self, market_time: datetime):
         if self.state == TradingState.IN_TRADE and not self.position.is_active:
@@ -181,9 +179,9 @@ class AuctionFailureSystem:
             if self.state != TradingState.STOPPED:
                 self._transition(TradingState.STOPPED, "Risk limit breached", timestamp)
 
-    # =========================
+    # -------------------------
     # CORE LOOP
-    # =========================
+    # -------------------------
 
     def process_market_update(self, ms: MarketState):
         self._enforce_risk_kill(ms.timestamp)
@@ -191,6 +189,13 @@ class AuctionFailureSystem:
             return
 
         self._enforce_invariants(ms.timestamp)
+
+        # instrumentation: bar/session counts
+        self.density["bars_total"] += 1
+        if self._in_hours(ms.timestamp):
+            self.density["bars_in_session"] += 1
+        else:
+            self.density["bars_outside_session"] += 1
 
         self.market_data.append(ms)
         self.market_data = self.market_data[-self.config.MAX_BARS_STORED:]
@@ -210,50 +215,91 @@ class AuctionFailureSystem:
         # DAILY RESET
         if self.last_reset_date != ms.timestamp.date() and ms.timestamp.time() >= self.config.SESSION_START:
             self.risk_manager.reset_daily()
-            self.trades_today = self.wins_today = self.losses_today = 0
             self.last_reset_date = ms.timestamp.date()
             self.log("DAILY_RESET", ms.timestamp)
 
+        # INIT
         if self.state == TradingState.INITIALIZING:
             if len(self.market_data) >= self.config.MIN_BARS_FOR_ANALYSIS:
                 self._transition(
                     TradingState.MONITORING if self._in_hours(ms.timestamp) else TradingState.NO_TRADE,
                     "Warmup complete",
-                    ms.timestamp
+                    ms.timestamp,
                 )
+            return
 
-        elif self.state == TradingState.MONITORING:
+        # FIX: NO_TRADE must be able to return to MONITORING
+        if self.state == TradingState.NO_TRADE:
+            if self._in_hours(ms.timestamp):
+                self._transition(TradingState.MONITORING, "Session opened", ms.timestamp)
+            return
+
+        # MONITORING
+        if self.state == TradingState.MONITORING:
             if not self._in_hours(ms.timestamp):
+                # if we were tracking a setup and session ended, count it
+                if self.pending_setup is not None:
+                    self.density["entries_blocked_by_session"] += 1
+                    self.pending_setup = None
                 self._transition(TradingState.NO_TRADE, "Market closed", ms.timestamp)
                 return
 
             can_trade, reason = self.risk_manager.can_trade()
             if not can_trade:
+                self.density["entries_blocked_by_risk"] += 1
                 self._transition(TradingState.STOPPED, reason, ms.timestamp)
                 return
 
-            setup = self._detect_setup(ms)
-            if setup and self._confirm_setup(setup, ms):
-                self._enter_trade(setup, ms)
+            # If a setup is pending, try to confirm it on subsequent bars (same confirm rules)
+            if self.pending_setup is not None:
+                age_min = (ms.timestamp - self.pending_setup["setup_time"]).total_seconds() / 60.0
+                if age_min > self.adaptive.acceptance_window_minutes():
+                    self.density["setups_expired_time_window"] += 1
+                    if not self.pending_setup.get("saw_volume_confirm", False):
+                        self.density["setups_failed_volume_confirm"] += 1
+                    self.pending_setup = None
+                    return
 
-        elif self.state == TradingState.IN_TRADE:
+                # record whether we ever see a confirm-volume bar
+                if ms.volume > self.adaptive.avg_volume * self.config.HIGH_VOLUME_THRESHOLD:
+                    self.pending_setup["saw_volume_confirm"] = True
+
+                # actual decision uses frozen confirm rule
+                if self._confirm_setup(self.pending_setup, ms):
+                    setup = self.pending_setup
+                    self.pending_setup = None
+                    self._enter_trade(setup, ms)
+                return
+
+            # Otherwise detect a new setup (frozen detection rule), then track it
+            setup = self._detect_setup(ms)
+            if setup:
+                self.density["setups_detected"] += 1
+                setup["saw_volume_confirm"] = False
+                self.pending_setup = setup
+            return
+
+        # IN_TRADE
+        if self.state == TradingState.IN_TRADE:
             reason = self._check_exit(ms)
             if reason:
                 self._exit_trade(ms, reason)
-                return
+            return
 
-        elif self.state == TradingState.COOLDOWN:
+        # COOLDOWN
+        if self.state == TradingState.COOLDOWN:
             if self.cooldown_until and ms.timestamp >= self.cooldown_until:
                 self._transition(
                     TradingState.MONITORING if self._in_hours(ms.timestamp) else TradingState.NO_TRADE,
                     "Cooldown ended",
-                    ms.timestamp
+                    ms.timestamp,
                 )
                 self.cooldown_until = None
+            return
 
-    # =========================
+    # -------------------------
     # STRATEGY LOGIC (FROZEN)
-    # =========================
+    # -------------------------
 
     def _in_hours(self, t: datetime) -> bool:
         return self.config.NO_TRADE_START <= t.time() <= self.config.NO_TRADE_END
@@ -283,40 +329,46 @@ class AuctionFailureSystem:
 
         return True
 
-    # =========================
-    # TRADE EXECUTION (PAPER)
-    # =========================
+    # -------------------------
+    # EXECUTION (PAPER)
+    # -------------------------
 
     def _enter_trade(self, setup: Dict, ms: MarketState):
+        self._current_setup_time = setup.get("setup_time")
+        self._current_setup_type = setup.get("type")
+
         direction = PositionDirection.SHORT if setup["type"] == "UPSIDE_ATTEMPT" else PositionDirection.LONG
         stop = ms.close + 10 if direction == PositionDirection.SHORT else ms.close - 10
         size = self.risk_manager.get_position_size(abs(ms.close - stop), self.instrument)
 
         self.position = Position(
-            direction, ms.close, ms.timestamp, size, stop, [],
-            ms.timestamp + timedelta(minutes=self.config.TIME_STOP_MINUTES)
+            direction=direction,
+            entry_price=ms.close,
+            entry_time=ms.timestamp,
+            size=size,
+            stop_loss=stop,
+            profit_targets=[],
+            time_stop=ms.timestamp + timedelta(minutes=self.config.TIME_STOP_MINUTES),
         )
 
         self._mae = 0.0
         self._mfe = 0.0
-
         self._transition(TradingState.IN_TRADE, "Position entered", ms.timestamp)
 
     def _exit_trade(self, ms: MarketState, reason: str):
-        # HARD GUARD: prevent double exit
+        # prevent double exit
         if not self.position.is_active:
             self.log("EXIT_IGNORED_ALREADY_FLAT", ms.timestamp)
             return
 
-        # Snapshot position BEFORE mutation
+        # snapshot
         entry_price = self.position.entry_price
+        entry_time = self.position.entry_time
         direction = self.position.direction
         size = self.position.size
 
-        # Immediately flatten position to prevent re-entry
-        self.position = Position(
-            PositionDirection.FLAT, 0.0, ms.timestamp, 0, 0.0, [], ms.timestamp
-        )
+        # flatten immediately
+        self.position = Position(PositionDirection.FLAT, 0.0, ms.timestamp, 0, 0.0, [], ms.timestamp)
 
         direction_mult = 1 if direction == PositionDirection.LONG else -1
         gross_pnl = (ms.close - entry_price) * direction_mult * size * 5
@@ -327,8 +379,13 @@ class AuctionFailureSystem:
 
         self.risk_manager.update_pnl(net_pnl)
 
+        mae_dollars = abs(min(0.0, self._mae)) * size * 5
+        mfe_dollars = max(0.0, self._mfe) * size * 5
+
         self.last_closed_trade = {
-            "entry_time": None,  # already known upstream
+            "setup_time": self._current_setup_time,
+            "setup_type": self._current_setup_type,
+            "entry_time": entry_time,
             "exit_time": ms.timestamp,
             "direction": direction.name,
             "size": size,
@@ -336,19 +393,18 @@ class AuctionFailureSystem:
             "net_pnl": net_pnl,
             "commission": commission,
             "slippage": slippage,
+            "mae": mae_dollars,
+            "mfe": mfe_dollars,
+            "time_in_trade_min": (ms.timestamp - entry_time).total_seconds() / 60.0,
             "exit_reason": reason,
         }
 
-        # FSM transition after exit
+        # cooldown behavior preserved
         if net_pnl <= 0:
-            self.cooldown_until = ms.timestamp + timedelta(
-                minutes=self.config.COOLDOWN_MINUTES_AFTER_LOSS
-            )
+            self.cooldown_until = ms.timestamp + timedelta(minutes=self.config.COOLDOWN_MINUTES_AFTER_LOSS)
             self._transition(TradingState.COOLDOWN, "Loss cooldown", ms.timestamp)
         else:
             self._transition(TradingState.MONITORING, "Trade closed", ms.timestamp)
-
-
 
     def _check_exit(self, ms: MarketState) -> Optional[str]:
         if self.position.direction == PositionDirection.LONG and ms.close <= self.position.stop_loss:

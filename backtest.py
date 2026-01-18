@@ -1,10 +1,9 @@
 # backtest.py
-# V0.2 — Edge Validation Backtester (NO STRATEGY CHANGES)
+# V0.2 — Edge Validation Backtester + Trade-Density Calibration
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
-from datetime import datetime
+from typing import List, Dict, Tuple
 import argparse
 
 from market import MarketState
@@ -12,25 +11,21 @@ from system import AuctionFailureSystem
 from config import Config
 
 
-# =========================
-# DATA LOADING
-# =========================
-
 def load_csv(path: str) -> List[MarketState]:
     df = pd.read_csv(path)
-
-    # normalize column names
     df.columns = [c.lower() for c in df.columns]
 
-    # map timestamp column
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
     elif "ts_event" in df.columns:
         df["timestamp"] = pd.to_datetime(df["ts_event"])
     else:
-        raise ValueError(
-            f"No usable timestamp column found. Columns: {df.columns.tolist()}"
-        )
+        raise ValueError(f"No usable timestamp column found. Columns: {df.columns.tolist()}")
+    
+    print("MIN TS:", df["timestamp"].min())
+    print("MAX TS:", df["timestamp"].max())
+    print("SAMPLE HOURS:", df["timestamp"].dt.hour.value_counts().sort_index().head(24))
+
 
     market_states = []
     for _, r in df.iterrows():
@@ -42,46 +37,35 @@ def load_csv(path: str) -> List[MarketState]:
                 low=r["low"],
                 close=r["close"],
                 volume=int(r["volume"]),
-                vwap=r.get(
-                    "vwap",
-                    (r["open"] + r["high"] + r["low"] + r["close"]) / 4,
-                ),
+                vwap=r.get("vwap", (r["open"] + r["high"] + r["low"] + r["close"]) / 4),
                 bid_volume=int(r.get("bid_volume", 0)),
                 ask_volume=int(r.get("ask_volume", 0)),
                 trades=int(r.get("trades", 0)),
                 has_bid_ask=("bid_volume" in df.columns and "ask_volume" in df.columns),
             )
         )
-
     return market_states
 
 
+def _run_system(market_states: List[MarketState], cfg: Config, capital: float) -> Tuple[pd.DataFrame, Dict]:
+    system = AuctionFailureSystem(initial_capital=capital)
+    system.config = cfg
 
-# =========================
-# BACKTEST CORE
-# =========================
-
-def run_backtest(
-    market_states: List[MarketState],
-    initial_capital: float = 10000.0,
-) -> pd.DataFrame:
-
-    system = AuctionFailureSystem(initial_capital=initial_capital)
     trades: List[Dict] = []
-
     for ms in market_states:
         system.process_market_update(ms)
-
         if system.last_closed_trade:
             trades.append(system.last_closed_trade.copy())
             system.last_closed_trade = None
 
-    return pd.DataFrame(trades)
+    df = pd.DataFrame(trades)
+    # normalize datetime columns if present
+    for c in ("setup_time", "entry_time", "exit_time"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
 
+    return df, system.density
 
-# =========================
-# METRICS
-# =========================
 
 def compute_edge_metrics(trades: pd.DataFrame) -> Dict:
     if trades.empty:
@@ -90,17 +74,17 @@ def compute_edge_metrics(trades: pd.DataFrame) -> Dict:
     wins = trades[trades["net_pnl"] > 0]
     losses = trades[trades["net_pnl"] <= 0]
 
-    expectancy = trades["net_pnl"].mean()
-    win_rate = len(wins) / len(trades)
-    avg_win = wins["net_pnl"].mean() if not wins.empty else 0.0
-    avg_loss = losses["net_pnl"].mean() if not losses.empty else 0.0
+    expectancy = float(trades["net_pnl"].mean())
+    win_rate = float(len(wins) / len(trades))
+    avg_win = float(wins["net_pnl"].mean()) if not wins.empty else 0.0
+    avg_loss = float(losses["net_pnl"].mean()) if not losses.empty else 0.0
 
-    gross_profit = wins["net_pnl"].sum()
-    gross_loss = abs(losses["net_pnl"].sum())
+    gross_profit = float(wins["net_pnl"].sum())
+    gross_loss = float(abs(losses["net_pnl"].sum()))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
 
     return {
-        "trades": len(trades),
+        "trades": int(len(trades)),
         "expectancy": expectancy,
         "win_rate": win_rate,
         "avg_win": avg_win,
@@ -111,6 +95,9 @@ def compute_edge_metrics(trades: pd.DataFrame) -> Dict:
 
 def print_metrics(metrics: Dict):
     print("\n=== EDGE METRICS (NET OF COSTS) ===")
+    if not metrics:
+        print("No completed trades.")
+        return
     for k, v in metrics.items():
         if isinstance(v, float):
             print(f"{k:15s}: {v: .4f}")
@@ -118,11 +105,11 @@ def print_metrics(metrics: Dict):
             print(f"{k:15s}: {v}")
 
 
-# =========================
-# CONDITIONAL EXPECTANCY
-# =========================
-
 def print_conditional_tables(trades: pd.DataFrame):
+    if trades.empty or "entry_time" not in trades.columns:
+        return
+
+    trades = trades.dropna(subset=["entry_time"])
     if trades.empty:
         return
 
@@ -135,15 +122,92 @@ def print_conditional_tables(trades: pd.DataFrame):
     print(trades.groupby("exit_reason")["net_pnl"].mean().round(2))
 
 
-# =========================
-# STRESS TESTING
-# =========================
+def print_density_report(density: Dict):
+    print("\n=== TRADE-DENSITY REPORT ===")
+    for k in [
+        "bars_total",
+        "bars_in_session",
+        "bars_outside_session",
+        "setups_detected",
+        "setups_failed_volume_confirm",
+        "setups_expired_time_window",
+        "entries_blocked_by_session",
+        "entries_blocked_by_risk",
+    ]:
+        if k in density:
+            print(f"{k:30s}: {density[k]}")
 
-def stress_test(
-    market_states: List[MarketState],
-    base_config: Config,
-    initial_capital: float,
-):
+
+def trades_per_year(trades_count: int, market_states: List[MarketState]) -> float:
+    days = len({ms.timestamp.date() for ms in market_states})
+    if days <= 0:
+        return 0.0
+    return trades_count / days * 252.0
+
+
+def calibrate_density(market_states: List[MarketState], capital: float, target_trades_per_year: int = 100) -> Config:
+    cfg = Config()
+
+    print("\n=== CALIBRATION: BASELINE RUN ===")
+    base_trades, base_density = _run_system(market_states, cfg, capital)
+    base_tpy = trades_per_year(len(base_trades), market_states)
+    print_density_report(base_density)
+    print(f"baseline trades: {len(base_trades)} | trades/year≈ {base_tpy:.1f}")
+
+    if base_tpy >= target_trades_per_year:
+        print("Target met at baseline.")
+        return cfg
+
+    # Ordered, minimal relaxation (one knob at a time, small steps)
+    # 1) If setups are detected but never confirm volume -> relax HIGH_VOLUME_THRESHOLD downward
+    # 2) If setups rarely detected -> relax LOW_VOLUME_THRESHOLD upward
+    # 3) If setups expire -> relax acceptance window base minutes upward
+    steps = []
+
+    # Decide primary blocker (simple heuristic)
+    if base_density.get("setups_detected", 0) == 0:
+        steps = [("LOW_VOLUME_THRESHOLD", +0.05, 1.00)]
+    elif base_density.get("setups_failed_volume_confirm", 0) > 0:
+        steps = [("HIGH_VOLUME_THRESHOLD", -0.05, 0.90)]
+    elif base_density.get("setups_expired_time_window", 0) > 0:
+        steps = [("BASE_ACCEPTANCE_WINDOW_MINUTES", +2, 20)]
+    else:
+        # fallback ordered plan
+        steps = [
+            ("HIGH_VOLUME_THRESHOLD", -0.05, 0.90),
+            ("LOW_VOLUME_THRESHOLD", +0.05, 1.00),
+            ("BASE_ACCEPTANCE_WINDOW_MINUTES", +2, 20),
+        ]
+
+    # Apply steps in order until target is met
+    for param, delta, bound in steps:
+        print(f"\n=== CALIBRATION: ADJUST {param} ===")
+        for i in range(1, 7):  # max 6 small moves, then stop
+            current = getattr(cfg, param)
+            new_val = current + delta
+
+            if delta > 0 and new_val > bound:
+                break
+            if delta < 0 and new_val < bound:
+                break
+
+            setattr(cfg, param, new_val)
+
+            trades_df, density = _run_system(market_states, cfg, capital)
+            tpy = trades_per_year(len(trades_df), market_states)
+
+            print_density_report(density)
+            print(f"{param}={getattr(cfg, param)} | trades: {len(trades_df)} | trades/year≈ {tpy:.1f}")
+
+            if tpy >= target_trades_per_year:
+                print("\nTarget trade density reached with minimal change.")
+                return cfg
+
+    print("\nCalibration could not reach target trade density with minimal allowed changes.")
+    return cfg
+
+
+def stress_test(market_states: List[MarketState], base_config: Config, initial_capital: float):
     print("\n=== PARAMETER STRESS TEST (±25%) ===")
 
     params = {
@@ -153,39 +217,26 @@ def stress_test(
     }
 
     rows = []
-
     for name, base in params.items():
         for mult in [0.75, 1.0, 1.25]:
             cfg = Config()
+            # start from base_config then nudge one param
+            cfg.LOW_VOLUME_THRESHOLD = base_config.LOW_VOLUME_THRESHOLD
+            cfg.HIGH_VOLUME_THRESHOLD = base_config.HIGH_VOLUME_THRESHOLD
+            cfg.TIME_STOP_MINUTES = base_config.TIME_STOP_MINUTES
+            if hasattr(cfg, "BASE_ACCEPTANCE_WINDOW_MINUTES"):
+                cfg.BASE_ACCEPTANCE_WINDOW_MINUTES = getattr(base_config, "BASE_ACCEPTANCE_WINDOW_MINUTES", 10)
+
             setattr(cfg, name, base * mult)
 
-            system = AuctionFailureSystem(initial_capital=initial_capital)
-            system.config = cfg
+            df, _ = _run_system(market_states, cfg, initial_capital)
+            expectancy = float(df["net_pnl"].mean()) if not df.empty else 0.0
 
-            trades = []
-            for ms in market_states:
-                system.process_market_update(ms)
-                if system.last_closed_trade:
-                    trades.append(system.last_closed_trade.copy())
-                    system.last_closed_trade = None
-
-            df = pd.DataFrame(trades)
-            expectancy = df["net_pnl"].mean() if not df.empty else 0.0
-
-            rows.append({
-                "parameter": name,
-                "multiplier": mult,
-                "expectancy": expectancy,
-                "trades": len(df),
-            })
+            rows.append({"parameter": name, "multiplier": mult, "expectancy": expectancy, "trades": len(df)})
 
     stress_df = pd.DataFrame(rows)
     print(stress_df.pivot(index="multiplier", columns="parameter", values="expectancy").round(2))
 
-
-# =========================
-# CLI
-# =========================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Auction Failure Bot — V0.2 Backtest")
@@ -193,18 +244,43 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="trades_v02.csv", help="Output trade CSV")
     parser.add_argument("--capital", type=float, default=10000.0)
     parser.add_argument("--stress", action="store_true")
+    parser.add_argument("--calibrate_density", action="store_true")
 
     args = parser.parse_args()
 
     market_states = load_csv(args.csv)
-    trades = run_backtest(market_states, args.capital)
+
+    if args.calibrate_density:
+        cfg = calibrate_density(market_states, args.capital, target_trades_per_year=100)
+        trades, density = _run_system(market_states, cfg, args.capital)
+
+        print("\n=== BEFORE vs AFTER (TRADE COUNT) ===")
+        print(f"Final config: LOW={cfg.LOW_VOLUME_THRESHOLD} HIGH={cfg.HIGH_VOLUME_THRESHOLD} "
+              f"WIN_BASE={getattr(cfg, 'BASE_ACCEPTANCE_WINDOW_MINUTES', 10)} TIME_STOP={cfg.TIME_STOP_MINUTES}")
+        print(f"Trades: {len(trades)} | trades/year≈ {trades_per_year(len(trades), market_states):.1f}")
+
+    else:
+        cfg = Config()
+        trades, density = _run_system(market_states, cfg, args.capital)
 
     trades.to_csv(args.out, index=False)
     print(f"\nSaved trade dataset → {args.out}")
+
+    print_density_report(density)
 
     metrics = compute_edge_metrics(trades)
     print_metrics(metrics)
     print_conditional_tables(trades)
 
     if args.stress:
-        stress_test(market_states, Config(), args.capital)
+        stress_test(market_states, cfg, args.capital)
+
+    # Honest verdict (simple rules)
+    if trades.empty:
+        print("\nVERDICT: edge untestable (no completed trades).")
+    else:
+        exp = metrics.get("expectancy", 0.0)
+        if exp <= 0:
+            print("\nVERDICT: edge rejected (expectancy <= 0 net of costs).")
+        else:
+            print("\nVERDICT: edge survives calibration (expectancy > 0 net of costs).")
