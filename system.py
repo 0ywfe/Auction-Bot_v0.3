@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import logging
 import json
 import numpy as np
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 from config import Config
 from market import MarketState, BarVolumeProfile
@@ -76,7 +77,6 @@ class AdaptiveParameters:
             self.recent_volatility = np.std(returns) * np.sqrt(252)
 
     def acceptance_window_minutes(self) -> int:
-        # Same logic as before, but base minutes is configurable for calibration
         base = getattr(self.config, "BASE_ACCEPTANCE_WINDOW_MINUTES", 10)
         vol_ratio = max(0.5, min(2.0, self.recent_volatility / self.config.VOLATILITY_BASELINE))
         return int(base / vol_ratio)
@@ -86,6 +86,10 @@ class AuctionFailureSystem:
     def __init__(self, instrument: str = "MES", initial_capital: float = 10000.0):
         self.config = Config()
         self.instrument = instrument
+
+        # Timezones: backtest feeds NY tz-aware timestamps; if naive, assume NY by default.
+        self.exchange_tz = ZoneInfo(getattr(self.config, "EXCHANGE_TIMEZONE", "America/New_York"))
+        self.data_tz = ZoneInfo(getattr(self.config, "DATA_TIMEZONE", "America/New_York"))
 
         self.state = TradingState.INITIALIZING
         self.position = Position(PositionDirection.FLAT, 0.0, datetime.utcnow(), 0, 0.0, [], datetime.utcnow())
@@ -97,28 +101,21 @@ class AuctionFailureSystem:
 
         self.risk_manager = RiskManager(self.config, initial_capital)
 
-        # V0.2 trade record
         self.last_closed_trade: Optional[Dict] = None
-
-        # Pending setup tracking (auction failure concept unchanged)
         self.pending_setup: Optional[Dict] = None
 
-        # Track setup time for dataset
         self._current_setup_time: Optional[datetime] = None
         self._current_setup_type: Optional[str] = None
 
-        # MAE/MFE tracking (points)
         self._mae = 0.0
         self._mfe = 0.0
 
-        # Trade-density instrumentation (requested)
         self.density = {
             "setups_detected": 0,
-            "setups_failed_volume_confirm": 0,   # setups that expire without ever meeting volume confirm
-            "setups_expired_time_window": 0,     # setups whose window expired before entry
-            "entries_blocked_by_session": 0,     # pending setup dropped because session ended
-            "entries_blocked_by_risk": 0,        # risk prevented entry
-            # extra helpful counters (not strategy)
+            "setups_failed_volume_confirm": 0,
+            "setups_expired_time_window": 0,
+            "entries_blocked_by_session": 0,
+            "entries_blocked_by_risk": 0,
             "bars_total": 0,
             "bars_in_session": 0,
             "bars_outside_session": 0,
@@ -126,6 +123,42 @@ class AuctionFailureSystem:
 
         self.last_reset_date = None
         self._setup_logging()
+
+    # -------------------------
+    # TIME HELPERS
+    # -------------------------
+
+    def _to_exchange_time(self, ts: datetime) -> datetime:
+        # If ts is naive, assume data_tz. Then convert to exchange_tz.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=self.data_tz)
+        return ts.astimezone(self.exchange_tz)
+
+    @staticmethod
+    def _in_window(t, start, end) -> bool:
+        # Handles overnight windows too
+        if start <= end:
+            return start <= t < end
+        return t >= start or t < end
+
+    def _in_hours(self, ts: datetime) -> bool:
+        # Normalize first
+        ts = self._to_exchange_time(ts)
+        t = ts.time()
+
+        # Must be within the main session
+        if not self._in_window(t, self.config.SESSION_START, self.config.SESSION_END):
+            return False
+
+        # Treat NO_TRADE_START/END as the *trade window* inside the session (matches your prior behavior)
+        if not self._in_window(t, self.config.NO_TRADE_START, self.config.NO_TRADE_END):
+            return False
+
+        # Exclude lunch window
+        if self._in_window(t, self.config.LUNCH_START, self.config.LUNCH_END):
+            return False
+
+        return True
 
     # -------------------------
     # LOGGING
@@ -184,18 +217,48 @@ class AuctionFailureSystem:
     # -------------------------
 
     def process_market_update(self, ms: MarketState):
-        self._enforce_risk_kill(ms.timestamp)
+        # Normalize to exchange time once
+        mt = self._to_exchange_time(ms.timestamp)
+
+        # ALWAYS allow daily reset even if STOPPED
+        if self.last_reset_date != mt.date() and mt.time() >= self.config.SESSION_START:
+            self.risk_manager.reset_daily()
+            self.last_reset_date = mt.date()
+            self.log("DAILY_RESET", mt)
+
+            if self.state == TradingState.STOPPED:
+                self._transition(
+                    TradingState.MONITORING if self._in_hours(mt) else TradingState.NO_TRADE,
+                    "Daily reset cleared STOPPED",
+                    mt,
+                )
+
+        # risk kill check (for current day)
+        self._enforce_risk_kill(mt)
         if self.state == TradingState.STOPPED:
             return
 
-        self._enforce_invariants(ms.timestamp)
-
-        # instrumentation: bar/session counts
+        # --- BAR ACCOUNTING (REQUIRED FOR DENSITY & CALIBRATION) ---
         self.density["bars_total"] += 1
-        if self._in_hours(ms.timestamp):
+        if self._in_hours(mt):
             self.density["bars_in_session"] += 1
         else:
             self.density["bars_outside_session"] += 1
+
+        # Use a MarketState with normalized timestamp for the rest of the system
+        ms = MarketState(
+            timestamp=mt,
+            open=ms.open,
+            high=ms.high,
+            low=ms.low,
+            close=ms.close,
+            volume=ms.volume,
+            vwap=ms.vwap,
+            bid_volume=ms.bid_volume,
+            ask_volume=ms.ask_volume,
+            trades=ms.trades,
+            has_bid_ask=ms.has_bid_ask,
+        )
 
         self.market_data.append(ms)
         self.market_data = self.market_data[-self.config.MAX_BARS_STORED:]
@@ -212,12 +275,6 @@ class AuctionFailureSystem:
                 self._mae = min(self._mae, self.position.entry_price - ms.high)
                 self._mfe = max(self._mfe, self.position.entry_price - ms.low)
 
-        # DAILY RESET
-        if self.last_reset_date != ms.timestamp.date() and ms.timestamp.time() >= self.config.SESSION_START:
-            self.risk_manager.reset_daily()
-            self.last_reset_date = ms.timestamp.date()
-            self.log("DAILY_RESET", ms.timestamp)
-
         # INIT
         if self.state == TradingState.INITIALIZING:
             if len(self.market_data) >= self.config.MIN_BARS_FOR_ANALYSIS:
@@ -228,7 +285,7 @@ class AuctionFailureSystem:
                 )
             return
 
-        # FIX: NO_TRADE must be able to return to MONITORING
+        # NO_TRADE → MONITORING when trading window opens
         if self.state == TradingState.NO_TRADE:
             if self._in_hours(ms.timestamp):
                 self._transition(TradingState.MONITORING, "Session opened", ms.timestamp)
@@ -237,7 +294,6 @@ class AuctionFailureSystem:
         # MONITORING
         if self.state == TradingState.MONITORING:
             if not self._in_hours(ms.timestamp):
-                # if we were tracking a setup and session ended, count it
                 if self.pending_setup is not None:
                     self.density["entries_blocked_by_session"] += 1
                     self.pending_setup = None
@@ -250,7 +306,6 @@ class AuctionFailureSystem:
                 self._transition(TradingState.STOPPED, reason, ms.timestamp)
                 return
 
-            # If a setup is pending, try to confirm it on subsequent bars (same confirm rules)
             if self.pending_setup is not None:
                 age_min = (ms.timestamp - self.pending_setup["setup_time"]).total_seconds() / 60.0
                 if age_min > self.adaptive.acceptance_window_minutes():
@@ -260,18 +315,15 @@ class AuctionFailureSystem:
                     self.pending_setup = None
                     return
 
-                # record whether we ever see a confirm-volume bar
                 if ms.volume > self.adaptive.avg_volume * self.config.HIGH_VOLUME_THRESHOLD:
                     self.pending_setup["saw_volume_confirm"] = True
 
-                # actual decision uses frozen confirm rule
                 if self._confirm_setup(self.pending_setup, ms):
                     setup = self.pending_setup
                     self.pending_setup = None
                     self._enter_trade(setup, ms)
                 return
 
-            # Otherwise detect a new setup (frozen detection rule), then track it
             setup = self._detect_setup(ms)
             if setup:
                 self.density["setups_detected"] += 1
@@ -300,9 +352,6 @@ class AuctionFailureSystem:
     # -------------------------
     # STRATEGY LOGIC (FROZEN)
     # -------------------------
-
-    def _in_hours(self, t: datetime) -> bool:
-        return self.config.NO_TRADE_START <= t.time() <= self.config.NO_TRADE_END
 
     def _detect_setup(self, ms: MarketState) -> Optional[Dict]:
         if len(self.market_data) < self.config.MIN_BARS_FOR_ANALYSIS:
@@ -356,18 +405,15 @@ class AuctionFailureSystem:
         self._transition(TradingState.IN_TRADE, "Position entered", ms.timestamp)
 
     def _exit_trade(self, ms: MarketState, reason: str):
-        # prevent double exit
         if not self.position.is_active:
             self.log("EXIT_IGNORED_ALREADY_FLAT", ms.timestamp)
             return
 
-        # snapshot
         entry_price = self.position.entry_price
         entry_time = self.position.entry_time
         direction = self.position.direction
         size = self.position.size
 
-        # flatten immediately
         self.position = Position(PositionDirection.FLAT, 0.0, ms.timestamp, 0, 0.0, [], ms.timestamp)
 
         direction_mult = 1 if direction == PositionDirection.LONG else -1
@@ -399,7 +445,6 @@ class AuctionFailureSystem:
             "exit_reason": reason,
         }
 
-        # cooldown behavior preserved
         if net_pnl <= 0:
             self.cooldown_until = ms.timestamp + timedelta(minutes=self.config.COOLDOWN_MINUTES_AFTER_LOSS)
             self._transition(TradingState.COOLDOWN, "Loss cooldown", ms.timestamp)

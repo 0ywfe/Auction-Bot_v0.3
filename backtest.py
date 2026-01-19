@@ -16,28 +16,43 @@ def load_csv(path: str) -> List[MarketState]:
     df.columns = [c.lower() for c in df.columns]
 
     if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     elif "ts_event" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["ts_event"])
+        df["timestamp"] = pd.to_datetime(df["ts_event"], utc=True)
     else:
         raise ValueError(f"No usable timestamp column found. Columns: {df.columns.tolist()}")
-    
-    print("MIN TS:", df["timestamp"].min())
-    print("MAX TS:", df["timestamp"].max())
-    print("SAMPLE HOURS:", df["timestamp"].dt.hour.value_counts().sort_index().head(24))
 
+    # UTC -> New York, KEEP tzinfo
+    df["timestamp"] = df["timestamp"].dt.tz_convert("America/New_York")
 
-    market_states = []
+    # --- CRITICAL: FILTER TO A SINGLE FUTURES STREAM ---
+    # Drop spreads like "MESU4-MESZ4"
+    df["symbol"] = df["symbol"].astype(str)
+    df = df[~df["symbol"].str.contains("-", regex=False)]
+
+    # Keep only MES contract symbols like MESU4, MESZ4 (MES + letter + digit)
+    df = df[df["symbol"].str.match(r"^MES[A-Z]\d$", na=False)]
+
+    # One bar per timestamp: pick the contract with max volume (liquidity proxy)
+    df = (
+        df.sort_values(["timestamp", "volume"], ascending=[True, False])
+          .groupby("timestamp", as_index=False)
+          .first()
+          .sort_values("timestamp")
+    )
+
+    market_states: List[MarketState] = []
     for _, r in df.iterrows():
+        ts = r["timestamp"].to_pydatetime()  # tz-aware NY datetime
         market_states.append(
             MarketState(
-                timestamp=r["timestamp"],
-                open=r["open"],
-                high=r["high"],
-                low=r["low"],
-                close=r["close"],
+                timestamp=ts,
+                open=float(r["open"]),
+                high=float(r["high"]),
+                low=float(r["low"]),
+                close=float(r["close"]),
                 volume=int(r["volume"]),
-                vwap=r.get("vwap", (r["open"] + r["high"] + r["low"] + r["close"]) / 4),
+                vwap=float(r.get("vwap", (r["open"] + r["high"] + r["low"] + r["close"]) / 4)),
                 bid_volume=int(r.get("bid_volume", 0)),
                 ask_volume=int(r.get("ask_volume", 0)),
                 trades=int(r.get("trades", 0)),
@@ -47,9 +62,10 @@ def load_csv(path: str) -> List[MarketState]:
     return market_states
 
 
+
 def _run_system(market_states: List[MarketState], cfg: Config, capital: float) -> Tuple[pd.DataFrame, Dict]:
     system = AuctionFailureSystem(initial_capital=capital)
-    system.config = cfg
+    system.config = cfg  # keep your existing pattern
 
     trades: List[Dict] = []
     for ms in market_states:
@@ -159,12 +175,6 @@ def calibrate_density(market_states: List[MarketState], capital: float, target_t
         return cfg
 
     # Ordered, minimal relaxation (one knob at a time, small steps)
-    # 1) If setups are detected but never confirm volume -> relax HIGH_VOLUME_THRESHOLD downward
-    # 2) If setups rarely detected -> relax LOW_VOLUME_THRESHOLD upward
-    # 3) If setups expire -> relax acceptance window base minutes upward
-    steps = []
-
-    # Decide primary blocker (simple heuristic)
     if base_density.get("setups_detected", 0) == 0:
         steps = [("LOW_VOLUME_THRESHOLD", +0.05, 1.00)]
     elif base_density.get("setups_failed_volume_confirm", 0) > 0:
@@ -172,17 +182,15 @@ def calibrate_density(market_states: List[MarketState], capital: float, target_t
     elif base_density.get("setups_expired_time_window", 0) > 0:
         steps = [("BASE_ACCEPTANCE_WINDOW_MINUTES", +2, 20)]
     else:
-        # fallback ordered plan
         steps = [
             ("HIGH_VOLUME_THRESHOLD", -0.05, 0.90),
             ("LOW_VOLUME_THRESHOLD", +0.05, 1.00),
             ("BASE_ACCEPTANCE_WINDOW_MINUTES", +2, 20),
         ]
 
-    # Apply steps in order until target is met
     for param, delta, bound in steps:
         print(f"\n=== CALIBRATION: ADJUST {param} ===")
-        for i in range(1, 7):  # max 6 small moves, then stop
+        for _ in range(1, 7):
             current = getattr(cfg, param)
             new_val = current + delta
 
@@ -220,7 +228,6 @@ def stress_test(market_states: List[MarketState], base_config: Config, initial_c
     for name, base in params.items():
         for mult in [0.75, 1.0, 1.25]:
             cfg = Config()
-            # start from base_config then nudge one param
             cfg.LOW_VOLUME_THRESHOLD = base_config.LOW_VOLUME_THRESHOLD
             cfg.HIGH_VOLUME_THRESHOLD = base_config.HIGH_VOLUME_THRESHOLD
             cfg.TIME_STOP_MINUTES = base_config.TIME_STOP_MINUTES
@@ -275,7 +282,6 @@ if __name__ == "__main__":
     if args.stress:
         stress_test(market_states, cfg, args.capital)
 
-    # Honest verdict (simple rules)
     if trades.empty:
         print("\nVERDICT: edge untestable (no completed trades).")
     else:
