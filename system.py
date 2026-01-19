@@ -395,8 +395,18 @@ class AuctionFailureSystem:
         self._current_setup_type = setup.get("type")
 
         direction = PositionDirection.SHORT if setup["type"] == "UPSIDE_ATTEMPT" else PositionDirection.LONG
-        stop = ms.close + 10 if direction == PositionDirection.SHORT else ms.close - 10
+
+        vlow, vhigh = self.volume_profile.get_value_area()
+        if vlow == vhigh:
+            return  # defensive: do not enter without structure
+
+        if direction == PositionDirection.SHORT:
+            stop = vhigh + 2
+        else:
+            stop = vlow - 2
+
         size = self.risk_manager.get_position_size(abs(ms.close - stop), self.instrument)
+
 
         self.position = Position(
             direction=direction,
