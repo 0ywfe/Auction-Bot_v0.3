@@ -23,3 +23,7 @@ env/
 *.so
 *.dll
 *.exe
+
+trades_*.csv
+*.csv
+
