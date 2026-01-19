@@ -373,10 +373,18 @@ class AuctionFailureSystem:
         if (ms.timestamp - setup["setup_time"]).total_seconds() / 60 > self.adaptive.acceptance_window_minutes():
             return False
 
-        if ms.volume <= self.adaptive.avg_volume * self.config.HIGH_VOLUME_THRESHOLD:
+        vlow, vhigh = self.volume_profile.get_value_area()
+        if vlow == vhigh:
             return False
 
-        return True
+        if setup["type"] == "UPSIDE_ATTEMPT":
+            return ms.close < vhigh   # price rejected above value and re-entered
+
+        if setup["type"] == "DOWNSIDE_ATTEMPT":
+            return ms.close > vlow   # price rejected below value and re-entered
+
+        return False
+
 
     # -------------------------
     # EXECUTION (PAPER)
