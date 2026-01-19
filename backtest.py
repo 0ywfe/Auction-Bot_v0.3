@@ -1,5 +1,7 @@
 # backtest.py
-# V0.2 — Edge Validation Backtester + Trade-Density Calibration
+# v0.3 — Intraday Regime Research Backtester (Directional & Mean Reversion)
+# Frozen: no tradable edge survives transaction costs
+
 
 import pandas as pd
 import numpy as np
