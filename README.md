@@ -25,6 +25,7 @@ This version is frozen as a **negative-results research release**.
 ## Status
 - v0.3 frozen
 - No further development in this repository
-- New hypotheses continue in v0.4 (separate project)
+- New hypotheses continue in v0.4 (separate project) 
+- I plan to pivot to LSE (London Stock Exchange) stuff now
 
 This repo is released for educational and research purposes.
