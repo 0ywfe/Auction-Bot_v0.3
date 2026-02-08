@@ -1,5 +1,7 @@
 # backtest.py
-# V0.2 — Edge Validation Backtester + Trade-Density Calibration
+# v0.3 — Intraday Regime Research Backtester (Directional & Mean Reversion)
+# Frozen: no tradable edge survives transaction costs
+
 
 import pandas as pd
 import numpy as np
@@ -9,6 +11,10 @@ import argparse
 from market import MarketState
 from system import AuctionFailureSystem
 from config import Config
+from datetime import timedelta
+
+HOLD_WINDOWS = [15, 30, 45, 60, 90]
+TEST_HOURS = [10, 11, 13, 14, 15]
 
 
 def load_csv(path: str) -> List[MarketState]:
@@ -81,6 +87,157 @@ def _run_system(market_states: List[MarketState], cfg: Config, capital: float) -
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
     return df, system.density
+
+
+def run_directional_drift(market_states: List[MarketState], hold_minutes: int = 60) -> pd.DataFrame:
+    trades = []
+
+    last_hour = None
+    in_trade = False
+    entry_price = None
+    entry_time = None
+    entry_hour = None
+
+    for ms in market_states:
+        ts = ms.timestamp
+        hour = ts.hour
+
+        # only test RTH-style hours you already observed
+        if hour not in [10, 11, 13, 14, 15]:
+            continue
+
+        # detect new hour
+        hour_bucket = ts.replace(minute=0, second=0, microsecond=0)
+
+        if not in_trade and hour_bucket != last_hour:
+            # enter LONG at first bar of hour
+            in_trade = True
+            entry_price = ms.open
+            entry_time = ts
+            entry_hour = hour
+            last_hour = hour_bucket
+            continue
+
+        if in_trade and ts >= entry_time + timedelta(minutes=hold_minutes):
+            raw_pnl = (ms.close - entry_price) * 5
+            cost = 10.0
+            pnl = raw_pnl - cost
+
+            trades.append({
+                "entry_time": entry_time,
+                "exit_time": ts,
+                "hour": entry_hour,
+                "net_pnl": pnl,
+                "exit_reason": "TIME_STOP"
+            })
+            in_trade = False
+            entry_price = None
+            entry_time = None
+            entry_hour = None
+
+    return pd.DataFrame(trades)
+
+
+def run_mean_reversion(market_states: List[MarketState], hold_minutes: int) -> pd.DataFrame:
+    trades = []
+
+    last_hour = None
+    in_trade = False
+    entry_price = None
+    entry_time = None
+    entry_hour = None
+    direction = None
+    hour_open = None
+
+    for ms in market_states:
+        ts = ms.timestamp
+        hour = ts.hour
+
+        if hour not in [10, 11, 13, 14, 15]:
+            continue
+
+        hour_bucket = ts.replace(minute=0, second=0, microsecond=0)
+
+        if hour_bucket != last_hour:
+            # reset for new hour
+            hour_open = ms.open
+            last_hour = hour_bucket
+            in_trade = False
+
+        # enter on first deviation from hour open
+        if not in_trade and hour_open is not None:
+            if ms.close > hour_open:
+                direction = -1  # SHORT
+            elif ms.close < hour_open:
+                direction = 1   # LONG
+            else:
+                continue
+
+            in_trade = True
+            entry_price = ms.close
+            entry_time = ts
+            entry_hour = hour
+            continue
+
+        if in_trade and ts >= entry_time + timedelta(minutes=hold_minutes):
+            raw_pnl = (ms.close - entry_price) * 5 * direction
+            pnl = raw_pnl - 10.0  # costs
+            trades.append({
+                "entry_time": entry_time,
+                "exit_time": ts,
+                "hour": entry_hour,
+                "hold_minutes": hold_minutes,
+                "net_pnl": pnl,
+                "exit_reason": "TIME_STOP"
+            })
+            in_trade = False
+            entry_price = None
+            entry_time = None
+            entry_hour = None
+            direction = None
+
+    return pd.DataFrame(trades)
+
+
+def build_mean_reversion_map(market_states: List[MarketState]) -> pd.DataFrame:
+    rows = []
+
+    for hold in HOLD_WINDOWS:
+        trades = run_mean_reversion(market_states, hold_minutes=hold)
+        if trades.empty:
+            continue
+
+        grouped = trades.groupby("hour")["net_pnl"].mean()
+        for hour, exp in grouped.items():
+            rows.append({
+                "hour": hour,
+                "hold_minutes": hold,
+                "expectancy": round(exp, 2),
+                "trades": int((trades["hour"] == hour).sum())
+            })
+
+    return pd.DataFrame(rows)
+
+
+
+def build_regime_map(market_states: List[MarketState]) -> pd.DataFrame:
+    rows = []
+
+    for hold in HOLD_WINDOWS:
+        trades = run_directional_drift(market_states, hold_minutes=hold)
+        if trades.empty:
+            continue
+
+        grouped = trades.groupby("hour")["net_pnl"].mean()
+        for hour, exp in grouped.items():
+            rows.append({
+                "hour": hour,
+                "hold_minutes": hold,
+                "expectancy": round(exp, 2),
+                "trades": int((trades["hour"] == hour).sum())
+            })
+
+    return pd.DataFrame(rows)
 
 
 def compute_edge_metrics(trades: pd.DataFrame) -> Dict:
@@ -247,28 +404,70 @@ def stress_test(market_states: List[MarketState], base_config: Config, initial_c
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Auction Failure Bot — V0.2 Backtest")
+    parser.add_argument("--regime-map", action="store_true", help="Build hour × holding-period expectancy map")
+    parser.add_argument("--directional", action="store_true", help="Run directional drift by hour experiment")
+    parser.add_argument("--hold", type=int, default=45, help="Holding period in minutes for directional drift experiment")
     parser.add_argument("--csv", required=True, help="Path to OHLCV CSV")
     parser.add_argument("--out", default="trades_v02.csv", help="Output trade CSV")
     parser.add_argument("--capital", type=float, default=10000.0)
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--calibrate_density", action="store_true")
+    parser.add_argument("--mean-reversion", action="store_true", help="Build hour × holding-period mean reversion map")
+
 
     args = parser.parse_args()
 
+
     market_states = load_csv(args.csv)
 
-    if args.calibrate_density:
-        cfg = calibrate_density(market_states, args.capital, target_trades_per_year=100)
-        trades, density = _run_system(market_states, cfg, args.capital)
 
-        print("\n=== BEFORE vs AFTER (TRADE COUNT) ===")
-        print(f"Final config: LOW={cfg.LOW_VOLUME_THRESHOLD} HIGH={cfg.HIGH_VOLUME_THRESHOLD} "
-              f"WIN_BASE={getattr(cfg, 'BASE_ACCEPTANCE_WINDOW_MINUTES', 10)} TIME_STOP={cfg.TIME_STOP_MINUTES}")
-        print(f"Trades: {len(trades)} | trades/year≈ {trades_per_year(len(trades), market_states):.1f}")
+    if args.mean_reversion:
+        df = build_mean_reversion_map(market_states)
 
-    else:
-        cfg = Config()
-        trades, density = _run_system(market_states, cfg, args.capital)
+        print("\n=== INTRADAY MEAN REVERSION REGIME MAP ===")
+        print(df.pivot(index="hour",
+                    columns="hold_minutes",
+                    values="expectancy").fillna(0))
+
+        print("\nTrades per cell:")
+        print(df.pivot(index="hour",
+                    columns="hold_minutes",
+                    values="trades").fillna(0))
+
+    exit(0)
+
+
+
+    if args.regime_map:
+        df = build_regime_map(market_states)
+
+        print("\n=== INTRADAY DIRECTIONAL REGIME MAP ===")
+        print(df.pivot(index="hour",
+                    columns="hold_minutes",
+                    values="expectancy").fillna(0))
+
+        print("\nTrades per cell:")
+        print(df.pivot(index="hour",
+                    columns="hold_minutes",
+                    values="trades").fillna(0))
+
+    exit(0)
+
+    if args.directional:
+        trades = run_directional_drift(market_states, hold_minutes=args.hold)
+
+
+        print("\n=== DIRECTIONAL DRIFT (LONG-ONLY, TIME EXIT) ===")
+        if trades.empty:
+            print("No trades generated.")
+        else:
+            print("\nExpectancy by hour:")
+            print(trades.groupby("hour")["net_pnl"].mean().round(2))
+            print("\nTrades by hour:")
+            print(trades.groupby("hour").size())
+            print(f"\nOverall expectancy: {trades['net_pnl'].mean():.2f}")
+
+        exit(0)
 
     trades.to_csv(args.out, index=False)
     print(f"\nSaved trade dataset → {args.out}")
